@@ -9,6 +9,12 @@ const PORT = parseInt(process.env.PORT || '3000');
 const TWENTY_API_KEY = process.env.TWENTY_API_KEY;
 const TWENTY_BASE_URL = process.env.TWENTY_BASE_URL;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '';
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || '';
+
+// OAuth2: issued access tokens (code → token)
+const oauthCodes = new Map<string, number>();  // code → expiry timestamp
+const oauthTokens = new Set<string>();          // valid access tokens
 
 if (!TWENTY_API_KEY) {
   console.error('TWENTY_API_KEY environment variable is required');
@@ -84,6 +90,59 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
+  // OAuth2 Authorization endpoint
+  if (req.url?.startsWith('/authorize') && OAUTH_CLIENT_ID) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const clientId = url.searchParams.get('client_id');
+    const redirectUri = url.searchParams.get('redirect_uri');
+    const state = url.searchParams.get('state') || '';
+
+    if (clientId !== OAUTH_CLIENT_ID || !redirectUri) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_client' }));
+      return;
+    }
+
+    const code = randomUUID();
+    oauthCodes.set(code, Date.now() + 60_000); // 60s expiry
+    const redirect = `${redirectUri}?code=${code}&state=${encodeURIComponent(state)}`;
+    res.writeHead(302, { Location: redirect });
+    res.end();
+    return;
+  }
+
+  // OAuth2 Token endpoint
+  if (req.url === '/token' && req.method === 'POST' && OAUTH_CLIENT_ID) {
+    const body = await getBody(req);
+    const params = new URLSearchParams(body);
+    const grantType = params.get('grant_type');
+    const clientId = params.get('client_id');
+    const clientSecret = params.get('client_secret');
+    const code = params.get('code');
+
+    if (clientId !== OAUTH_CLIENT_ID || clientSecret !== OAUTH_CLIENT_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_client' }));
+      return;
+    }
+
+    if (grantType === 'authorization_code' && code) {
+      const expiry = oauthCodes.get(code);
+      if (!expiry || Date.now() > expiry) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid_grant' }));
+        return;
+      }
+      oauthCodes.delete(code);
+    }
+
+    const accessToken = randomUUID();
+    oauthTokens.add(accessToken);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ access_token: accessToken, token_type: 'Bearer' }));
+    return;
+  }
+
   // MCP endpoint
   if (!req.url?.startsWith('/mcp')) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -91,17 +150,20 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  // Bearer token auth (skip for Anthropic IPs — they come via Cowork)
-  if (MCP_AUTH_TOKEN) {
+  // Auth: Bearer token OR OAuth2 access token OR Anthropic IP bypass
+  {
     const clientIp = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || '').split(',')[0].trim();
     const isAnthropicIp = isInCidr(clientIp, '160.79.104.0/21');
-    if (!isAnthropicIp) {
-      const auth = req.headers['authorization'];
-      if (auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
+    const auth = req.headers['authorization'];
+    const token = auth?.startsWith('Bearer ') ? auth.slice(7) : '';
+
+    const hasValidMcpToken = MCP_AUTH_TOKEN && token === MCP_AUTH_TOKEN;
+    const hasValidOauthToken = oauthTokens.has(token);
+
+    if (!isAnthropicIp && !hasValidMcpToken && !hasValidOauthToken) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
     }
   }
 
