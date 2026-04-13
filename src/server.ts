@@ -19,6 +19,14 @@ if (!TWENTY_BASE_URL) {
   process.exit(1);
 }
 
+function isInCidr(ip: string, cidr: string): boolean {
+  const [range, bits] = cidr.split('/');
+  const mask = ~(2 ** (32 - parseInt(bits)) - 1) >>> 0;
+  const ipNum = ip.split('.').reduce((acc, oct) => (acc << 8) + parseInt(oct), 0) >>> 0;
+  const rangeNum = range.split('.').reduce((acc, oct) => (acc << 8) + parseInt(oct), 0) >>> 0;
+  return (ipNum & mask) === (rangeNum & mask);
+}
+
 const client = new TwentyClient({
   apiKey: TWENTY_API_KEY,
   baseUrl: TWENTY_BASE_URL,
@@ -83,13 +91,17 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  // Bearer token auth
+  // Bearer token auth (skip for Anthropic IPs — they come via Cowork)
   if (MCP_AUTH_TOKEN) {
-    const auth = req.headers['authorization'];
-    if (auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized' }));
-      return;
+    const clientIp = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || '').split(',')[0].trim();
+    const isAnthropicIp = isInCidr(clientIp, '160.79.104.0/21');
+    if (!isAnthropicIp) {
+      const auth = req.headers['authorization'];
+      if (auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
     }
   }
 
