@@ -8,6 +8,7 @@ import { registerAllTools } from './tools.js';
 const PORT = parseInt(process.env.PORT || '3000');
 const TWENTY_API_KEY = process.env.TWENTY_API_KEY;
 const TWENTY_BASE_URL = process.env.TWENTY_BASE_URL;
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 if (!TWENTY_API_KEY) {
   console.error('TWENTY_API_KEY environment variable is required');
@@ -80,6 +81,16 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
     return;
+  }
+
+  // Bearer token auth
+  if (MCP_AUTH_TOKEN) {
+    const auth = req.headers['authorization'];
+    if (auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
   }
 
   try {
