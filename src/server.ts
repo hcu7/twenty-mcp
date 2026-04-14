@@ -120,7 +120,7 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
         registration_endpoint: `${base}/register`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code'],
-        token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
+        token_endpoint_auth_methods_supported: ['client_secret_post'],
         code_challenge_methods_supported: ['S256', 'plain'],
         scopes_supported: ['mcp'],
       }));
@@ -166,7 +166,9 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
 
     const code = randomUUID();
     oauthCodes.set(code, { expiry: Date.now() + 60_000, challenge, method: challengeMethod });
-    const redirect = `${redirectUri}?code=${code}&state=${encodeURIComponent(state)}`;
+    const host = req.headers.host || '';
+    const issuer = host ? `https://${host}` : '';
+    const redirect = `${redirectUri}?code=${code}&state=${encodeURIComponent(state)}&iss=${encodeURIComponent(issuer)}`;
     res.writeHead(302, { Location: redirect });
     res.end();
     return;
@@ -182,19 +184,13 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     const code = params.get('code') || '';
     const codeVerifier = params.get('code_verifier') || '';
 
-    const hasSecret = !!clientSecret;
-    const hasPkce = !!codeVerifier;
+    // Require client_secret; PKCE remains supported as optional additional layer
     if (clientId !== OAUTH_CLIENT_ID) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'invalid_client' }));
       return;
     }
-    if (hasSecret && clientSecret !== OAUTH_CLIENT_SECRET) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'invalid_client' }));
-      return;
-    }
-    if (!hasSecret && !hasPkce) {
+    if (!clientSecret || clientSecret !== OAUTH_CLIENT_SECRET) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'invalid_client' }));
       return;
@@ -241,8 +237,12 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     else if (hasValidOauthToken) authMethod = 'oauth';
 
     if (authMethod === 'none') {
-      auditLog({ event: 'mcp_request', ip: clientIp, method: req.method, result: '401_unauthorized' });
-      res.writeHead(401, { 'Content-Type': 'application/json' });
+      const reason = !auth ? 'no_auth_header' : !auth.startsWith('Bearer ') ? 'not_bearer_scheme' : !token ? 'empty_token' : 'unknown_token';
+      auditLog({ event: 'mcp_request', ip: clientIp, method: req.method, result: '401_unauthorized', reason, token_len: token.length, tokens_issued: oauthTokens.size });
+      const host = req.headers.host || '';
+      const metaUrl = host ? `https://${host}/.well-known/oauth-protected-resource` : '';
+      const wwwAuth = `Bearer realm="mcp", resource_metadata="${metaUrl}"`;
+      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': wwwAuth });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
