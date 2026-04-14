@@ -1,5 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { TwentyClient } from './twenty-client.js';
@@ -13,8 +13,19 @@ const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '';
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || '';
 
 // OAuth2: issued access tokens (code → token)
-const oauthCodes = new Map<string, number>();  // code → expiry timestamp
+interface CodeEntry { expiry: number; challenge: string; method: string; }
+const oauthCodes = new Map<string, CodeEntry>();
 const oauthTokens = new Set<string>();          // valid access tokens
+
+function verifyPKCE(verifier: string, challenge: string, method: string): boolean {
+  if (!challenge) return true;
+  if (method === 'S256') {
+    const computed = createHash('sha256').update(verifier).digest('base64url');
+    return computed === challenge;
+  }
+  if (method === '' || method === 'plain') return verifier === challenge;
+  return false;
+}
 
 // Audit logging
 function auditLog(event: Record<string, unknown>): void {
@@ -109,7 +120,7 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
         registration_endpoint: `${base}/register`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code'],
-        token_endpoint_auth_methods_supported: ['client_secret_post'],
+        token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
         code_challenge_methods_supported: ['S256', 'plain'],
         scopes_supported: ['mcp'],
       }));
@@ -144,6 +155,8 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     const clientId = url.searchParams.get('client_id');
     const redirectUri = url.searchParams.get('redirect_uri');
     const state = url.searchParams.get('state') || '';
+    const challenge = url.searchParams.get('code_challenge') || '';
+    const challengeMethod = url.searchParams.get('code_challenge_method') || (challenge ? 'plain' : '');
 
     if (clientId !== OAUTH_CLIENT_ID || !redirectUri) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -152,7 +165,7 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     }
 
     const code = randomUUID();
-    oauthCodes.set(code, Date.now() + 60_000); // 60s expiry
+    oauthCodes.set(code, { expiry: Date.now() + 60_000, challenge, method: challengeMethod });
     const redirect = `${redirectUri}?code=${code}&state=${encodeURIComponent(state)}`;
     res.writeHead(302, { Location: redirect });
     res.end();
@@ -165,23 +178,41 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     const params = new URLSearchParams(body);
     const grantType = params.get('grant_type');
     const clientId = params.get('client_id');
-    const clientSecret = params.get('client_secret');
-    const code = params.get('code');
+    const clientSecret = params.get('client_secret') || '';
+    const code = params.get('code') || '';
+    const codeVerifier = params.get('code_verifier') || '';
 
-    if (clientId !== OAUTH_CLIENT_ID || clientSecret !== OAUTH_CLIENT_SECRET) {
+    const hasSecret = !!clientSecret;
+    const hasPkce = !!codeVerifier;
+    if (clientId !== OAUTH_CLIENT_ID) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_client' }));
+      return;
+    }
+    if (hasSecret && clientSecret !== OAUTH_CLIENT_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_client' }));
+      return;
+    }
+    if (!hasSecret && !hasPkce) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'invalid_client' }));
       return;
     }
 
     if (grantType === 'authorization_code' && code) {
-      const expiry = oauthCodes.get(code);
-      if (!expiry || Date.now() > expiry) {
+      const entry = oauthCodes.get(code);
+      if (!entry || Date.now() > entry.expiry) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'invalid_grant' }));
         return;
       }
       oauthCodes.delete(code);
+      if (entry.challenge && !verifyPKCE(codeVerifier, entry.challenge, entry.method)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid_grant' }));
+        return;
+      }
     }
 
     const accessToken = randomUUID();
