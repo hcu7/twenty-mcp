@@ -150,17 +150,14 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  // Auth: Bearer token OR OAuth2 access token OR Anthropic IP bypass
+  // Auth: Bearer token OR OAuth2 access token (no IP bypass)
   {
-    const clientIp = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || '').split(',')[0].trim();
-    const isAnthropicIp = isInCidr(clientIp, '160.79.104.0/21');
     const auth = req.headers['authorization'];
     const token = auth?.startsWith('Bearer ') ? auth.slice(7) : '';
-
     const hasValidMcpToken = MCP_AUTH_TOKEN && token === MCP_AUTH_TOKEN;
     const hasValidOauthToken = oauthTokens.has(token);
 
-    if (!isAnthropicIp && !hasValidMcpToken && !hasValidOauthToken) {
+    if (!hasValidMcpToken && !hasValidOauthToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
