@@ -96,6 +96,48 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
+  // OAuth 2.0 discovery endpoints (for Cowork/Claude auto-discovery)
+  if (OAUTH_CLIENT_ID) {
+    const host = req.headers.host || '';
+    const base = host ? `https://${host}` : '';
+    if (req.url === '/.well-known/oauth-authorization-server') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        issuer: base,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        registration_endpoint: `${base}/register`,
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code'],
+        token_endpoint_auth_methods_supported: ['client_secret_post'],
+        code_challenge_methods_supported: ['S256', 'plain'],
+        scopes_supported: ['mcp'],
+      }));
+      return;
+    }
+    if (req.url === '/.well-known/oauth-protected-resource') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        resource: base,
+        authorization_servers: [base],
+        bearer_methods_supported: ['header'],
+        scopes_supported: ['mcp'],
+      }));
+      return;
+    }
+    if (req.url === '/register' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        client_id: OAUTH_CLIENT_ID,
+        client_secret: OAUTH_CLIENT_SECRET,
+        token_endpoint_auth_method: 'client_secret_post',
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+      }));
+      return;
+    }
+  }
+
   // OAuth2 Authorization endpoint
   if (req.url?.startsWith('/authorize') && OAUTH_CLIENT_ID) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
