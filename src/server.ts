@@ -16,6 +16,12 @@ const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || '';
 const oauthCodes = new Map<string, number>();  // code → expiry timestamp
 const oauthTokens = new Set<string>();          // valid access tokens
 
+// Audit logging
+function auditLog(event: Record<string, unknown>): void {
+  const record = { ts: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), svc: 'twenty-mcp', ...event };
+  console.log(`[MCP-AUDIT] ${JSON.stringify(record)}`);
+}
+
 if (!TWENTY_API_KEY) {
   console.error('TWENTY_API_KEY environment variable is required');
   process.exit(1);
@@ -151,13 +157,18 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
   }
 
   // Auth: Bearer token OR OAuth2 access token (no IP bypass)
+  const clientIp = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || '').split(',')[0].trim();
+  let authMethod = 'none';
   {
     const auth = req.headers['authorization'];
     const token = auth?.startsWith('Bearer ') ? auth.slice(7) : '';
     const hasValidMcpToken = MCP_AUTH_TOKEN && token === MCP_AUTH_TOKEN;
     const hasValidOauthToken = oauthTokens.has(token);
+    if (hasValidMcpToken) authMethod = 'bearer';
+    else if (hasValidOauthToken) authMethod = 'oauth';
 
-    if (!hasValidMcpToken && !hasValidOauthToken) {
+    if (authMethod === 'none') {
+      auditLog({ event: 'mcp_request', ip: clientIp, method: req.method, result: '401_unauthorized' });
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -188,6 +199,24 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     if (req.method === 'POST') {
       const bodyText = await getBody(req);
       const body = bodyText.trim() ? JSON.parse(bodyText) : undefined;
+
+      // Audit log
+      if (body && typeof body === 'object') {
+        const info: Record<string, unknown> = {
+          event: 'mcp_call', ip: clientIp, auth: authMethod,
+          size: bodyText.length, rpc_method: body.method,
+        };
+        const params = body.params || {};
+        if (body.method === 'tools/call') {
+          info.tool = params.name;
+          const args = params.arguments || {};
+          info.arg_keys = typeof args === 'object' && args ? Object.keys(args).sort() : [];
+        } else if (body.method === 'initialize') {
+          info.client = (params.clientInfo || {}).name || '?';
+        }
+        auditLog(info);
+      }
+
       await transport.handleRequest(req, res, body);
     } else if (req.method === 'GET' || req.method === 'DELETE') {
       await transport.handleRequest(req, res);
